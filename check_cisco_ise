@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+
+# check_cisco_ise v0.2
+
+# This add-on SSHes to an ISE node and parses the ISE application status output
+# There are three commands possible: check, list, version 
+#
+# ./check_cisco_ise -H somehost -l userid -a passwd -v check -p "Application Server,Database Server" --running
+#
+# ./check_cisco_ise -H somehost -l userid -a passwd version
+#
+# ./check_cisco_ise -H somehost -l userid -a passwd list -rndi
+#
+#
+# A raw output screen typically looks like this:
+# 
+# ON-ISE5V/admin#show application status ise
+# 
+# ISE PROCESS NAME                       STATE            PROCESS ID
+# --------------------------------------------------------------------
+# Database Listener                      running          7690
+# Database Server                        running          147 PROCESSES
+# Application Server                     initializing
+# Profiler Database                      running          14449
+# ISE Indexing Engine                    running          996572
+# AD Connector                           running          40887
+# M&T Session Database                   running          20627
+# M&T Log Processor                      running          25371
+# Certificate Authority Service          disabled
+# EST Service                            disabled
+# SXP Engine Service                     disabled
+# TC-NAC Service                         disabled
+# PassiveID WMI Service                  running          28820
+# PassiveID Syslog Service               running          30402
+# PassiveID API Service                  not running
+# PassiveID Agent Service                running          1045928
+# PassiveID Endpoint Service             running          38357
+# PassiveID SPAN Service                 running          40684
+# DHCP Server (dhcpd)                    disabled
+# DNS Server (named)                     disabled
+# ISE Messaging Service                  running          10658
+# ISE API Gateway Database Service       running          13314
+# ISE API Gateway Service                running          1033418
+# ISE pxGrid Direct Service              initializing
+# Segmentation Policy Service            disabled
+# REST Auth Service                      disabled
+# SSE Connector                          disabled
+# Hermes (pxGrid Cloud Agent)            disabled
+# McTrust (Meraki Sync Service)          disabled
+# ISE Node Exporter                      running          41739
+# ISE Prometheus Service                 running          42939
+# ISE Grafana Service                    running          45073
+# ISE MNT LogAnalytics Elasticsearch     running          143916
+# ISE Logstash Service                   running          151480
+# ISE Kibana Service                     running          158409
+
+import argparse
+from netmiko import ConnectHandler
+from sys import exit
+import time
+
+def send_command(handle,expect,cmd):
+    handle.write_channel(cmd)
+    handle.write_channel("\r\n")
+
+    output = ''
+    timer = 0
+
+    while True:
+        output = output + handle.read_channel()
+        if output.endswith(expect):
+            break
+        time.sleep(2)
+        timer = timer + 2
+        if timer > max_timeout:
+            output = False
+            break
+        if timer % 60 == 0:
+            print("Awaiting prompt for {mins} minutes".format(timer))
+
+    return output
+
+def parse_detail(output):
+    state='INIT'
+    data=output.split("\n")
+    detail=dict()
+    tabs=dict()
+    for line in data:
+        if len(line) == 0:
+            continue
+        if len(line.split()) < 2:
+            continue
+        if state == 'INIT' and line.split()[1] =='PROCESS':
+            tabs[1] = line.find('ISE PROCESS NAME')
+            tabs[2] = line.find('STATE')
+            tabs[3] = line.find('PROCESS ID')
+            state = 'DATA'
+        elif state == 'DATA':
+            detail[line[tabs[1]:tabs[2]-1].rstrip()] = line[tabs[2]:].split()[0]
+    return(detail)
+
+# Global variables
+cmd_status = 'show application status ise'
+cmd_string = ''
+cmd_version = 'show version'
+expect_string = 'admin#'
+max_timeout = 50
+discovered_process_table = dict()
+return_code = 0
+return_text = "OK - Successfully completed"
+timer = 0
+verbose_output = ''
+
+device={ 'device_type':'terminal_server',
+         'ip':'my-ise-server.example.internal',
+         'username':'admin',
+         'password':'Gobbledygook',
+         'global_delay_factor':2
+        }
+
+parser = argparse.ArgumentParser(description='Check ISE process status')
+
+# ISE Server access parameters
+required = parser.add_argument_group('Required arguments')
+required.add_argument('-H', dest='host', action='store', help='Host', required=True)
+required.add_argument('-l', dest='username', action='store', help='Username', required=True)
+required.add_argument('-a', dest='password', action='store', help='Password', required=True)
+
+subparsers = parser.add_subparsers(help='commands')
+
+# version command
+version_parser = subparsers.add_parser('version', help='Get live ISE version')
+version_parser.set_defaults(command='version')
+
+# list command
+list_parser = subparsers.add_parser('list', help='List live ISE processes')
+list_parser.add_argument('--running', '-r', default=False, action='store_true', help='List "running" state')
+list_parser.add_argument('--disabled', '-d', default=False, action='store_true', help='List "disabled" state')
+list_parser.add_argument('--notrunning', '-n', default=False, action='store_true', help='List "not running" state')
+list_parser.add_argument('--initializing', '-i', default=False, action='store_true', help='List "initializing" state')
+list_parser.set_defaults(command='list')
+
+# check command
+check_parser = subparsers.add_parser('check', help='Check state(s) of live ISE process(es)')
+check_parser.add_argument('--process', action='store',required=True, type=str, help='Process list for state checking')
+check_parser.set_defaults(command='check')
+# check command - mutually exclusive arguments
+check_group = check_parser.add_mutually_exclusive_group(required = True)
+check_group.add_argument('--running', '-r', action='store_true', help='Check "running" state')
+check_group.add_argument('--disabled', '-d', action='store_true', help='Check "disabled" state')
+check_group.add_argument('--notrunning', '-n', action='store_true', help='Check "not running" state')
+check_group.add_argument('--initializing', '-i', action='store_true', help='Check "initializing" state')
+
+# Optional arguments
+parser.add_argument('--verbose', '-v', action='store_true', default=False, help='Verbosity')
+
+args = parser.parse_args()
+
+# argument processing
+device['username'] = args.username
+device['password'] = args.password
+device['ip'] = args.host
+
+# Argparse has enforced a single state for a check and allowed multiple states for a list
+requested_state_table = dict(running=args.running,
+                             notrunning=args.notrunning,
+                             disabled=args.disabled,
+                             initializing=args.initializing)
+
+# work out what show command needs to be sent
+if args.command == "version":
+    cmd_string = cmd_version
+else:
+    cmd_string = cmd_status
+
+# Connect to ISE server and authenticate
+ssh_connect = ConnectHandler(**device)
+time.sleep(2)
+
+# If we connected, then press enter to get a clean prompt
+if ssh_connect.is_alive():
+    result = send_command(ssh_connect,expect_string,'')
+
+# If we get a clean prompt, then send whatever command is required
+    if result:
+        result = send_command(ssh_connect,expect_string,cmd_string)
+        if result:
+            ssh_connect.disconnect()
+
+#           (at this point we could check for a nonsense result, say, due to timeout before command output etc...)
+
+#           "check" and "list" both require show status output processing
+            if args.command == "check" or args.command == "list":
+                discovered_process_table = parse_detail(result)
+
+#               if this is a check, then we have been supplied with a list of requested processes
+                if args.command == "check":
+                    requested_process_list = [(item.strip()) for item in args.process.split(',')]
+
+#               if this is a list, then we populate with discovered processes instead
+                else:
+                    requested_process_list = [(discovered_process) for discovered_process in discovered_process_table]
+
+#               From this point, we are using with the following structures:
+
+#               discovered_process_table : dictionary['process':'discovered_state']
+#               requested_state_table : dictionary['requested_state':'True|False']
+#               requested_process_list : ['requested_process1',requested_process2',...]
+
+#               iterate through the resulting list 
+                for requested_process in requested_process_list:
+
+#                   exceptions will only occur for checks against non-existent processes
+                    if args.command == "check":
+                        try:
+                            verbose_output = verbose_output + "\nProcess \"{}\" is {}".format(requested_process, discovered_process_table[requested_process])
+                            if not requested_state_table[discovered_process_table[requested_process]]:
+                                if return_code < 1:
+                                    return_code = 1
+                        except:
+                            return_code = 2
+                            verbose_output = verbose_output + '\nProcess \"{}\" not found'.format(requested_process)
+
+#                   for a "list", only report on processes with one of the requested states
+                    elif requested_state_table[discovered_process_table[requested_process]]:
+                        verbose_output = verbose_output + "\nProcess \"{}\" is {}".format(requested_process, discovered_process_table[requested_process])
+
+#               compose a suitable completion message
+                if return_code == 2:
+                    return_text = 'CRITICAL - process(es) NOT FOUND'
+                elif return_code == 1:
+                    return_text = 'WARNING - process(es) NOT found in the desired state'
+                elif return_code == 0:
+                    return_text = "OK - {} command completed successfully".format(args.command)
+
+#           "version" processing here (both just return the output)
+            else:
+                for line in result:
+                    verbose_output = verbose_output + line
+                return_text = "Command output complete"
+
+#       No result returned
+        else:
+            return_code = 2
+            return_text = "CRITICAL - Unexpected or no response to server command"
+
+#   Didn't get as far as sending a command
+    else:
+        return_code = 2
+        return_text = "CRITICAL - Logon prompt never seen"
+
+else:
+    return_code = 2
+    return_text = "CRITICAL - Unable to connect to ISE server"
+
+print(return_text)
+if args.verbose or args.command == "version" or args.command == "list":
+    print(verbose_output)
+exit(return_code)
+
